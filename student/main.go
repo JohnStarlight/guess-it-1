@@ -15,99 +15,151 @@ import (
 //	round(10_000_000 / (1 + width) / (n - 1))
 //
 // n being the size of the data set (12 500 lines in every provided set).
-// For values uniformly distributed over a support of s integers, a range
-// covering k of them hits with probability k/s, so the expected score is
 //
-//	(k/s) * (n-1) * round(10^7 / (k * (n-1)))
+// Every provided data set follows the same model: a straight line
+// (slope 0 for data sets 1-3, slope 1 for 4-5) plus independent noise,
+// mostly uniform over ~101 integers, polluted with up to ~2 % of
+// astronomically large outliers. The program therefore:
 //
-// Because of the per-guess rounding, the expected score is NOT flat in k:
-// some k get a "free" round-up (e.g. k=94 gives 9 points per hit instead
-// of the flat 8), so we pick k by maximizing that expression exactly.
+//  1. estimates the slope robustly (median of the consecutive
+//     differences, immune to the outliers),
+//  2. de-trends the values and drops the outliers using the median and
+//     the MAD of the residuals,
+//  3. picks the guessing window over the residual distribution by
+//     maximizing the expected score exactly: a window covering count
+//     residuals out of total earns (count/total) * round(10^7/(k*(n-1)))
+//     per guess for a width of k integers. Because of the per-guess
+//     rounding some widths are strictly better than others (e.g. k=94
+//     over a uniform support of 101 earns 9 points per hit instead of
+//     the flat 8).
 const (
 	expectedGuesses = 12499 // n-1 for the tester's data sets
-	warmup          = 50    // guesses answered with a safe wide range
-	outlierMult     = 8.0   // reject values beyond this many MADs from the median
-	madEvery        = 64    // recompute the MAD every this many inserts
+	warmup          = 100   // guesses answered with a safe wide range
+	outlierMult     = 8.0   // reject residuals beyond this many MADs from the median
+	refreshEvery    = 128   // re-estimate the model every this many values
+	maxSpan         = 4096  // safety cap for the residual histogram size
 )
 
-// stats keeps every inlier value in a sorted slice so the median,
-// the MAD and the support bounds are cheap to query.
-type stats struct {
-	sorted []float64
-	mad    float64 // cached median absolute deviation
-	dirty  int     // inserts since the MAD was last refreshed
-}
-
-func (s *stats) add(v float64) {
-	i := sort.SearchFloat64s(s.sorted, v)
-	s.sorted = append(s.sorted, 0)
-	copy(s.sorted[i+1:], s.sorted[i:])
-	s.sorted[i] = v
-	s.dirty++
-}
-
-func medianOf(sorted []float64) float64 {
+func median(sorted []int) float64 {
 	n := len(sorted)
 	if n == 0 {
 		return 0
 	}
 	if n%2 == 0 {
-		return (sorted[n/2-1] + sorted[n/2]) / 2
+		return float64(sorted[n/2-1]+sorted[n/2]) / 2
 	}
-	return sorted[n/2]
+	return float64(sorted[n/2])
 }
 
-func (s *stats) median() float64 { return medianOf(s.sorted) }
-
-// refreshMAD recomputes the cached median absolute deviation, a spread
-// measure that, unlike the standard deviation, is immune to the
-// astronomically large outliers present in some data sets.
-func (s *stats) refreshMAD() {
-	med := s.median()
-	devs := make([]float64, len(s.sorted))
-	for i, v := range s.sorted {
-		devs[i] = math.Abs(v - med)
-	}
-	sort.Float64s(devs)
-	s.mad = medianOf(devs)
-	s.dirty = 0
+// model is the cached prediction state, re-estimated every refreshEvery
+// values: the next value at index x is expected in
+// [slope*x + offset, slope*x + offset + width - 1].
+type model struct {
+	slope  int
+	offset int
+	width  int
 }
 
-func (s *stats) isOutlier(v float64) bool {
-	if s.dirty >= madEvery {
-		s.refreshMAD()
-	}
-	return math.Abs(v-s.median()) > outlierMult*math.Max(s.mad, 1)
-}
+// fit estimates the model from all values seen so far.
+func fit(values []int) model {
+	n := len(values)
 
-// dropOutliers rebuilds the sorted slice keeping inliers only. Called once
-// after the warmup, in case an outlier slipped in before the statistics
-// were stable enough to filter.
-func (s *stats) dropOutliers() {
-	s.refreshMAD()
-	med := s.median()
-	keep := s.sorted[:0]
-	for _, v := range s.sorted {
-		if math.Abs(v-med) <= outlierMult*math.Max(s.mad, 1) {
-			keep = append(keep, v)
+	// Robust slope (Theil-Sen with a long baseline): the median of the
+	// slopes of pairs half the data apart. The long gap divides the noise
+	// away and the median is immune to the outliers. Consecutive
+	// differences would NOT work: their median has a standard error of
+	// about half a unit, so the rounded slope would flap between values.
+	gap := n / 2
+	slopes := make([]float64, 0, n-gap)
+	for i := 0; i+gap < n; i++ {
+		slopes = append(slopes, float64(values[i+gap]-values[i])/float64(gap))
+	}
+	sort.Float64s(slopes)
+	mid := slopes[len(slopes)/2]
+	slope := int(math.Round(mid))
+
+	// De-trend, then reject outliers with median +- outlierMult * MAD.
+	res := make([]int, n)
+	for i, v := range values {
+		res[i] = v - slope*i
+	}
+	sort.Ints(res)
+	med := median(res)
+	devs := make([]int, n)
+	for i, r := range res {
+		devs[i] = int(math.Abs(float64(r) - med))
+	}
+	sort.Ints(devs)
+	cut := outlierMult * math.Max(median(devs), 1)
+
+	inMin, inMax := math.MaxInt64, math.MinInt64
+	var inliers []int
+	for _, r := range res {
+		if math.Abs(float64(r)-med) <= cut {
+			inliers = append(inliers, r)
+			if r < inMin {
+				inMin = r
+			}
+			if r > inMax {
+				inMax = r
+			}
 		}
 	}
-	s.sorted = keep
-	s.refreshMAD()
-}
+	span := inMax - inMin + 1
+	if span > maxSpan { // paranoia; the MAD cut keeps real data far below this
+		span = maxSpan
+	}
 
-// bestCover returns how many values of a support of size s the range
-// should cover to maximize the expected score under the tester's
-// per-guess rounding.
-func bestCover(s int) int {
-	bestK, bestScore := s, 0.0
-	for k := 1; k <= s; k++ {
+	// Histogram of the inlier residuals, smoothed with a small moving
+	// average: a single bin that got lucky must not look like a better
+	// bet than it will be on future draws.
+	hist := make([]float64, span)
+	for _, r := range inliers {
+		if b := r - inMin; b < span {
+			hist[b]++
+		}
+	}
+	smooth := make([]float64, span)
+	const rad = 3
+	for i := range hist {
+		lo, hi := i-rad, i+rad
+		if lo < 0 {
+			lo = 0
+		}
+		if hi >= span {
+			hi = span - 1
+		}
+		var sum float64
+		for j := lo; j <= hi; j++ {
+			sum += hist[j]
+		}
+		smooth[i] = sum / float64(hi-lo+1)
+	}
+	prefix := make([]float64, span+1)
+	for i := 0; i < span; i++ {
+		prefix[i+1] = prefix[i] + smooth[i]
+	}
+
+	// Exhaustively pick the window (position and width) with the highest
+	// expected score under the tester's per-guess rounding. Even smoothed,
+	// the count of the winning window overstates its future hit rate
+	// (the maximum over thousands of candidates is biased upward by
+	// sampling luck, worst for tiny windows), so penalize each count by a
+	// few standard deviations (~sqrt(count)) before comparing.
+	bestScore, bestLo, bestK := -1.0, inMin, span
+	for k := 1; k <= span; k++ {
 		perHit := math.Round(10_000_000 / (float64(k) * expectedGuesses))
-		if score := float64(k) / float64(s) * perHit; score > bestScore {
-			bestK, bestScore = k, score
+		if perHit == 0 {
+			break
+		}
+		for a := 0; a+k <= span; a++ {
+			count := prefix[a+k] - prefix[a]
+			if score := (count - 2.5*math.Sqrt(count)) * perHit; score > bestScore {
+				bestScore, bestLo, bestK = score, inMin+a, k
+			}
 		}
 	}
-	return bestK
+	return model{slope: slope, offset: bestLo, width: bestK}
 }
 
 func main() {
@@ -115,43 +167,36 @@ func main() {
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
 
-	var s stats
-	seen := 0
+	var values []int
+	var m model
 
 	for in.Scan() {
 		line := strings.TrimSpace(in.Text())
 		if line == "" {
 			continue
 		}
-		v, err := strconv.ParseFloat(line, 64)
+		f, err := strconv.ParseFloat(line, 64)
 		if err != nil {
 			continue
 		}
-		seen++
+		values = append(values, int(math.Round(f)))
+		t := len(values) // index of the value to predict
 
-		if seen <= warmup {
-			s.add(v)
-			if seen == warmup {
-				s.dropOutliers()
-			}
-			// Not enough data for stable bounds yet: answer with a
-			// generous range around the median.
-			med := int(math.Round(s.median()))
+		if t <= warmup {
+			// Not enough data for a stable model yet: answer with a
+			// generous range around the median of what we have seen.
+			cp := append([]int(nil), values...)
+			sort.Ints(cp)
+			med := int(math.Round(median(cp)))
 			fmt.Fprintf(out, "%d %d\n", med-50, med+50)
 			continue
 		}
 
-		if !s.isOutlier(v) {
-			s.add(v)
+		if t == warmup+1 || (t-warmup)%refreshEvery == 0 {
+			m = fit(values)
 		}
 
-		// The inliers are uniformly spread, so their min/max estimate the
-		// support precisely; cover the best k of its s integers, centered.
-		min := int(math.Round(s.sorted[0]))
-		max := int(math.Round(s.sorted[len(s.sorted)-1]))
-		support := max - min + 1
-		k := bestCover(support)
-		lo := min + (support-k)/2
-		fmt.Fprintf(out, "%d %d\n", lo, lo+k-1)
+		lo := m.slope*t + m.offset
+		fmt.Fprintf(out, "%d %d\n", lo, lo+m.width-1)
 	}
 }

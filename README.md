@@ -18,23 +18,26 @@ guess-it-1/
 The tester rewards each correct guess with `round(10^7 / (1 + width) / (n - 1))`
 points, so the narrower the range, the more each hit is worth.
 
-The graded data sets are ~99 % uniformly distributed integers over
-`[100, 200]`, polluted with ~1 % astronomically large outliers. The program:
+Every provided data set follows the same model: a straight line (slope 0 for
+Data 1–3, slope 1 for Data 4–5) plus independent noise, mostly uniform over
+~101 integers, polluted with up to ~2 % astronomically large outliers
+(±10⁹ in Data 2). The program:
 
-1. **Filters outliers** using the median and the MAD (median absolute
-   deviation), which unlike the mean/standard deviation are immune to the
-   huge outliers.
-2. **Estimates the support** `[min, max]` of the distribution from the
-   filtered values.
-3. **Chooses the range width** by maximizing the exact expected score: for a
-   uniform distribution over `s` integers, a range covering `k` of them hits
-   with probability `k/s` and earns `round(10^7 / (k·(n-1)))` per hit.
-   Because of the rounding, some widths are strictly better than others —
-   for the tester's data sets the optimum covers 94 of the 101 values
-   (9 points per hit at a ~93 % hit rate).
+1. **Estimates the trend** with a robust long-baseline Theil–Sen slope (the
+   median of the slopes of pairs half the data apart), immune to outliers.
+2. **De-trends and filters outliers** using the median and the MAD (median
+   absolute deviation) of the residuals, which unlike the mean/standard
+   deviation are not wrecked by the huge outliers.
+3. **Chooses the guessing window** over the residual distribution by
+   maximizing the exact expected score: a window covering `k` integers earns
+   `round(10^7 / (k·(n-1)))` per hit, and because of that rounding some
+   widths are strictly better than others (covering 94 of the 101 support
+   values earns 9 points per hit instead of the flat 8). The residual
+   histogram is smoothed and the candidate counts are penalized by their
+   sampling noise so the optimizer does not chase lucky bins.
 
-This scores ≈ 104 000–106 000 on every graded data file, which beats every
-provided AI guesser on expectation.
+This scores ≈ 103 000–106 000 (~90 % correct guesses) on every data file of
+Data 1–5, which beats every provided AI guesser on expectation.
 
 ## Testing with the provided tester
 
@@ -44,11 +47,22 @@ docker compose up -d
 ```
 
 The compose file mounts `../student` into the container, so the tester always
-runs the current version of the program. Then open
-`http://localhost:3000/?guesser=<name>` (e.g. `median`, `linear-regr`, `nic`,
-see `guess-it-dockerized/README.md` for the full list) and click a
-`Test Data` button. The first run compiles the Go program and takes a few
-extra seconds; subsequent runs are instant.
+runs the current version of the program. Then open the tester with the AI
+guesser to compete against in the URL:
+
+```
+http://localhost:3000/?guesser=average
+http://localhost:3000/?guesser=big-range
+http://localhost:3000/?guesser=correlation-coef
+http://localhost:3000/?guesser=huge-range
+http://localhost:3000/?guesser=linear-regr
+http://localhost:3000/?guesser=median
+http://localhost:3000/?guesser=mse
+http://localhost:3000/?guesser=nic
+```
+
+and click a `Test Data` button. The first run compiles the Go program and
+takes a few extra seconds; subsequent runs are instant.
 
 Stop the tester with:
 
