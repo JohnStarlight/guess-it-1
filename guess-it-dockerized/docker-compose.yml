@@ -1,0 +1,12 @@
+services:
+  node:
+    build: ./
+    # The ai/ guessers are x86-64 binaries: force amd64 so they also run
+    # on ARM machines (Apple Silicon) through emulation.
+    platform: linux/amd64
+    ports:
+      - '3000:3000'
+    volumes:
+      # The student program lives at the repository root; mount it where
+      # the tester expects it (./student relative to the tester root).
+      - ../student:/app/student:ro
